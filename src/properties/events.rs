@@ -9,7 +9,9 @@ use crate::prelude::*;
 
 #[derive(Event, Clone, Debug)]
 pub struct TiledObjectCreated {
-    pub entity: Entity,
+    pub object: Entity,
+    pub layer: Entity,
+    pub map: Entity,
     pub object_data: ObjectData,
     pub map_size: TilemapSize,
 }
@@ -27,7 +29,7 @@ impl TiledObjectCreated {
     pub fn spawn_collider(&self, mut commands: Commands, collider_callback: ColliderCallback) {
         insert_object_colliders(
             &mut commands,
-            self.entity,
+            self.object,
             &self.object_data,
             collider_callback,
         )

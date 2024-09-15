@@ -32,6 +32,11 @@ use std::sync::Arc;
 
 #[cfg(feature = "user_properties")]
 use std::ops::Deref;
+#[cfg(feature = "user_properties")]
+use crate::properties::{
+    load::DeserializedMapProperties,
+    command::PropertiesCommandExt,
+};
 
 use bevy::{
     asset::{
@@ -40,7 +45,7 @@ use bevy::{
     prelude::*,
     utils::HashMap,
 };
-
+use bevy::reflect::{TypeRegistry, TypeRegistryArc};
 #[cfg(feature = "physics")]
 use crate::physics::{insert_object_colliders, insert_tile_colliders};
 
@@ -59,9 +64,10 @@ impl Plugin for TiledMapPlugin {
         {
             app.init_non_send_resource::<TiledObjectRegistry>();
             app.init_non_send_resource::<TiledCustomTileRegistry>();
+            app.add_systems(Startup, export::export_types);
         }
         app.init_asset::<TiledMap>()
-            .register_asset_loader(TiledLoader)
+            .init_asset_loader::<TiledLoader>()
             .add_systems(Update, (handle_map_events, process_loaded_maps));
     }
 }
@@ -71,6 +77,9 @@ pub struct TiledMap {
     pub map: tiled::Map,
 
     pub tilemap_textures: HashMap<usize, TilemapTexture>,
+    
+    #[cfg(feature = "user_properties")]
+    pub properties: DeserializedMapProperties,
 
     // The offset into the tileset_images for each tile id within each tileset.
     #[cfg(not(feature = "atlas"))]
@@ -107,7 +116,19 @@ impl<'a, 'b> tiled::ResourceReader for BytesResourceReader<'a, 'b> {
     }
 }
 
-pub struct TiledLoader;
+pub struct TiledLoader {
+    #[cfg(feature = "user_properties")]
+    pub registry: TypeRegistryArc,
+}
+
+impl FromWorld for TiledLoader {
+    fn from_world(world: &mut World) -> Self {
+        Self {
+            #[cfg(feature = "user_properties")]
+            registry: world.resource::<AppTypeRegistry>().0.clone()
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum TiledAssetLoaderError {
@@ -184,10 +205,17 @@ impl AssetLoader for TiledLoader {
 
             tilemap_textures.insert(tileset_index, tilemap_texture);
         }
+        
+        #[cfg(feature = "user_properties")]
+        let properties = DeserializedMapProperties::load(&map, self.registry.read().deref(), load_context);
 
+        dbg!(&properties);
+        
         let asset_map = TiledMap {
             map,
             tilemap_textures,
+            #[cfg(feature = "user_properties")]
+            properties,
             #[cfg(not(feature = "atlas"))]
             tile_image_offsets,
         };
@@ -208,7 +236,7 @@ fn handle_map_events(
     mut commands: Commands,
     mut map_events: EventReader<AssetEvent<TiledMap>>,
     tile_storage_query: Query<(Entity, &TileStorage)>,
-    mut map_query: Query<(Entity, &Handle<TiledMap>, &mut TiledLayersStorage)>,
+    mut map_query: Query<(Entity, &Handle<TiledMap>, &mut TiledIdStorage)>,
     layer_query: Query<(Entity, &TiledMapLayer), With<TiledMapLayer>>,
 ) {
     for event in map_events.read() {
@@ -247,14 +275,12 @@ fn process_loaded_maps(
         (
             Entity,
             &Handle<TiledMap>,
-            &mut TiledLayersStorage,
+            &mut TiledIdStorage,
             &TilemapRenderSettings,
             &TiledMapSettings,
         ),
         Or<(Changed<Handle<TiledMap>>, With<RespawnTiledMap>)>,
     >,
-    #[cfg(feature = "user_properties")] objects_registry: NonSend<TiledObjectRegistry>,
-    #[cfg(feature = "user_properties")] custom_tiles_registry: NonSend<TiledCustomTileRegistry>,
 ) {
     for (map_entity, map_handle, mut layer_storage, render_settings, tiled_settings) in
         map_query.iter_mut()
@@ -277,10 +303,6 @@ fn process_loaded_maps(
                     tiled_map,
                     render_settings,
                     tiled_settings,
-                    #[cfg(feature = "user_properties")]
-                    &objects_registry,
-                    #[cfg(feature = "user_properties")]
-                    &custom_tiles_registry,
                 );
                 commands.entity(map_entity).remove::<RespawnTiledMap>();
             }
@@ -291,7 +313,7 @@ fn process_loaded_maps(
 fn remove_map_by_asset_id(
     commands: &mut Commands,
     tile_storage_query: &Query<(Entity, &TileStorage)>,
-    map_query: &mut Query<(Entity, &Handle<TiledMap>, &mut TiledLayersStorage)>,
+    map_query: &mut Query<(Entity, &Handle<TiledMap>, &mut TiledIdStorage)>,
     layer_query: &Query<(Entity, &TiledMapLayer), With<TiledMapLayer>>,
     asset_id: &AssetId<TiledMap>,
 ) {
@@ -324,9 +346,9 @@ fn remove_map_by_asset_id(
 fn remove_layers(
     commands: &mut Commands,
     tile_storage_query: &Query<(Entity, &TileStorage)>,
-    layer_storage: &mut TiledLayersStorage,
+    layer_storage: &mut TiledIdStorage,
 ) {
-    for layer_entity in layer_storage.storage.values() {
+    for layer_entity in layer_storage.layers.values() {
         if let Ok((_, layer_tile_storage)) = tile_storage_query.get(*layer_entity) {
             for tile in layer_tile_storage.iter().flatten() {
                 commands.entity(*tile).despawn_recursive()
@@ -334,20 +356,18 @@ fn remove_layers(
         }
         commands.entity(*layer_entity).despawn_recursive();
     }
-    layer_storage.storage.clear();
+    layer_storage.layers.clear();
 }
 
 #[allow(clippy::too_many_arguments, unused_mut)]
 fn load_map(
     mut commands: &mut Commands,
-    layer_storage: &mut TiledLayersStorage,
+    layer_storage: &mut TiledIdStorage,
     map_entity: Entity,
     map_handle: &Handle<TiledMap>,
     tiled_map: &TiledMap,
     render_settings: &TilemapRenderSettings,
     tiled_settings: &TiledMapSettings,
-    #[cfg(feature = "user_properties")] objects_registry: &TiledObjectRegistry,
-    #[cfg(feature = "user_properties")] custom_tiles_registry: &TiledCustomTileRegistry,
 ) {
     commands
         .entity(map_entity)
@@ -440,8 +460,6 @@ fn load_map(
                     &grid_size,
                     render_settings,
                     tiled_settings,
-                    #[cfg(feature = "user_properties")]
-                    custom_tiles_registry,
                 );
             }
             LayerType::Objects(object_layer) => {
@@ -449,8 +467,11 @@ fn load_map(
                     .entity(layer_entity)
                     .insert(Name::new(format!("TiledMapObjectLayer({})", layer.name)))
                     .insert(TiledMapObjectLayer);
+
+
                 load_objects_layer(
                     commands,
+                    map_entity,
                     layer_entity,
                     layer,
                     object_layer,
@@ -458,8 +479,7 @@ fn load_map(
                     &map_size,
                     &grid_size,
                     tiled_settings,
-                    #[cfg(feature = "user_properties")]
-                    objects_registry,
+                    &mut layer_storage.objects,
                 );
             }
             LayerType::Group(_group_layer) => {
@@ -479,8 +499,26 @@ fn load_map(
         }
 
         layer_storage
-            .storage
-            .insert(layer_index as u32, layer_entity);
+            .layers
+            .insert(layer.id(), layer_entity);
+    }
+    
+    #[cfg(feature = "user_properties")]
+    {
+        let mut props = tiled_map.properties.clone().hydrate(&layer_storage.objects);
+        
+        commands.entity(map_entity)
+            .insert_properties(props.map);
+        
+        for (id, &entity) in layer_storage.objects.iter() {
+            commands.entity(entity)
+                .insert_properties(props.objects.remove(id).unwrap());
+        }
+        
+        for (id, &entity) in layer_storage.layers.iter() {
+            commands.entity(entity)
+                .insert_properties(props.layers.remove(dbg!(id)).unwrap());
+        }
     }
 }
 
@@ -496,7 +534,6 @@ fn load_tiles_layer(
     grid_size: &TilemapGridSize,
     render_settings: &TilemapRenderSettings,
     tiled_settings: &TiledMapSettings,
-    #[cfg(feature = "user_properties")] custom_tiles_registry: &TiledCustomTileRegistry,
 ) {
     // The TilemapBundle requires that all tile images come exclusively from a single
     // tiled texture or from a Vec of independent per-tile images. Furthermore, all of
@@ -546,8 +583,6 @@ fn load_tiles_layer(
                 tileset_index,
                 tilemap_texture,
                 tiled_settings,
-                #[cfg(feature = "user_properties")]
-                custom_tiles_registry,
             ),
             tiled::TileLayer::Infinite(layer_data) => {
                 let (storage, new_map_size, origin) = load_infinite_tiles_layer(
@@ -559,8 +594,6 @@ fn load_tiles_layer(
                     tileset_index,
                     tilemap_texture,
                     tiled_settings,
-                    #[cfg(feature = "user_properties")]
-                    custom_tiles_registry,
                 );
                 map_size = new_map_size;
                 // log::info!("Infinite layer origin: {:?}", origin);
@@ -604,7 +637,6 @@ fn load_finite_tiles_layer(
     tileset_index: usize,
     tilemap_texture: &TilemapTexture,
     tiled_settings: &TiledMapSettings,
-    #[cfg(feature = "user_properties")] custom_tiles_registry: &TiledCustomTileRegistry,
 ) -> TileStorage {
     let mut tile_storage = TileStorage::empty(*map_size);
     for x in 0..map_size.x {
@@ -633,7 +665,7 @@ fn load_finite_tiles_layer(
                 #[cfg(not(feature = "atlas"))]
                 TilemapTexture::Vector(_) =>
                     *tiled_map.tile_image_offsets.get(&(tileset_index, layer_tile.id()))
-                    .expect("The offset into to image vector should have been saved during the initial load."),
+                        .expect("The offset into to image vector should have been saved during the initial load."),
                 #[cfg(not(feature = "atlas"))]
                 _ => unreachable!()
             };
@@ -671,8 +703,6 @@ fn load_finite_tiles_layer(
                 tiled_settings,
                 map_size,
                 grid_size,
-                #[cfg(feature = "user_properties")]
-                custom_tiles_registry,
             );
 
             tile_storage.set(&tile_pos, tile_entity);
@@ -692,7 +722,6 @@ fn load_infinite_tiles_layer(
     tileset_index: usize,
     tilemap_texture: &TilemapTexture,
     tiled_settings: &TiledMapSettings,
-    #[cfg(feature = "user_properties")] custom_tiles_registry: &TiledCustomTileRegistry,
 ) -> (TileStorage, TilemapSize, (f32, f32)) {
     // Determine top left coordinate so we can offset the map.
     let (topleft_x, topleft_y) = infinite_layer
@@ -766,7 +795,7 @@ fn load_infinite_tiles_layer(
                     #[cfg(not(feature = "atlas"))]
                     TilemapTexture::Vector(_) =>
                         *tiled_map.tile_image_offsets.get(&(tileset_index, layer_tile.id()))
-                        .expect("The offset into to image vector should have been saved during the initial load."),
+                            .expect("The offset into to image vector should have been saved during the initial load."),
                     #[cfg(not(feature = "atlas"))]
                     _ => unreachable!()
                 };
@@ -803,8 +832,6 @@ fn load_infinite_tiles_layer(
                     tiled_settings,
                     &map_size,
                     grid_size,
-                    #[cfg(feature = "user_properties")]
-                    custom_tiles_registry,
                 );
 
                 tile_storage.set(&tile_pos, tile_entity);
@@ -818,6 +845,7 @@ fn load_infinite_tiles_layer(
 #[allow(clippy::too_many_arguments, unused)]
 fn load_objects_layer(
     commands: &mut Commands,
+    map_entity: Entity,
     layer_entity: Entity,
     layer: Layer,
     object_layer: ObjectLayer,
@@ -825,7 +853,7 @@ fn load_objects_layer(
     map_size: &TilemapSize,
     grid_size: &TilemapGridSize,
     tiled_settings: &TiledMapSettings,
-    #[cfg(feature = "user_properties")] objects_registry: &TiledObjectRegistry,
+    entity_map: &mut HashMap<u32, Entity>,
 ) {
     #[cfg(feature = "physics")]
     let collision_layer_names =
@@ -866,6 +894,8 @@ fn load_objects_layer(
             .set_parent(layer_entity)
             .id();
 
+        entity_map.insert(object_data.id(), _object_entity);
+
         #[cfg(feature = "physics")]
         {
             if collision_layer_names.contains(&layer.name.trim().to_lowercase()) {
@@ -880,22 +910,32 @@ fn load_objects_layer(
 
         #[cfg(feature = "user_properties")]
         {
-            if let Some(phantom) = objects_registry.get(&object_data.user_type) {
-                phantom.initialize(
-                    commands,
-                    &TiledObjectCreated {
-                        entity: _object_entity,
-                        object_data: object_data.deref().clone(),
-                        map_size: *map_size,
-                    },
-                );
-            } else {
-                log::warn!(
-                    "Skipping unregistered object (name='{}' type='{}')",
-                    object_data.name,
-                    object_data.user_type
-                );
-            }
+            // if let Some(phantom) = objects_registry.get(&object_data.user_type) {
+            //     phantom.initialize(
+            //         commands,
+            //         &TiledObjectCreated {
+            //             entity: _object_entity,
+            //             object_data: object_data.deref().clone(),
+            //             map_size: *map_size,
+            //         },
+            //     );
+            // } else {
+            //     log::warn!(
+            //         "Skipping unregistered object (name='{}' type='{}')",
+            //         object_data.name,
+            //         object_data.user_type
+            //     );
+            // }
+
+            // commands.trigger(
+            //     TiledObjectCreated {
+            //         object: _object_entity,
+            //         layer: layer_entity,
+            //         map: map_entity,
+            //         object_data: object_data.deref().clone(),
+            //         map_size: *map_size,
+            //     }
+            // );
         }
     }
 }
@@ -937,7 +977,6 @@ fn handle_special_tile(
     _tiled_settings: &TiledMapSettings,
     _map_size: &TilemapSize,
     _grid_size: &TilemapGridSize,
-    #[cfg(feature = "user_properties")] custom_tiles_registry: &TiledCustomTileRegistry,
 ) {
     // Handle animated tiles
     if let Some(animated_tile) = get_animated_tile(tile) {
@@ -947,21 +986,12 @@ fn handle_special_tile(
     // Handle custom tiles (with user properties)
     #[cfg(feature = "user_properties")]
     {
-        if let Some(user_type) = &tile.user_type {
-            if let Some(phantom) = custom_tiles_registry.get(user_type) {
-                phantom.initialize(
-                    commands,
-                    &TiledCustomTileCreated {
-                        entity: tile_entity,
-                        tile_data: tile.deref().clone(),
-                        map_size: *_map_size,
-                        grid_size: *_grid_size,
-                    },
-                );
-            } else {
-                log::warn!("Skipping unregistered custom tile (type = '{}')", user_type);
-            }
-        }
+        commands.trigger(TiledCustomTileCreated {
+            entity: tile_entity,
+            tile_data: tile.deref().clone(),
+            map_size: *_map_size,
+            grid_size: *_grid_size,
+        });
     }
 
     // Handle tiles with collision

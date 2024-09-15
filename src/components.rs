@@ -6,10 +6,11 @@ use bevy_ecs_tilemap::prelude::*;
 #[derive(Component)]
 pub struct RespawnTiledMap;
 
-// Stores a list of tiled layers.
+// Stores maps from Tiled ID to Bevy Entity.
 #[derive(Component, Default)]
-pub struct TiledLayersStorage {
-    pub storage: HashMap<u32, Entity>,
+pub struct TiledIdStorage {
+    pub layers: HashMap<u32, Entity>,
+    pub objects: HashMap<u32, Entity>,
 }
 
 /// Marker component for a Tiled map.
@@ -65,7 +66,7 @@ pub enum MapPositioning {
 #[derive(Default, Bundle)]
 pub struct TiledMapBundle {
     pub tiled_map: Handle<TiledMap>,
-    pub storage: TiledLayersStorage,
+    pub storage: TiledIdStorage,
     pub transform: Transform,
     pub global_transform: GlobalTransform,
     pub render_settings: TilemapRenderSettings,
